@@ -868,14 +868,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
                     logits[modal] = x
 
                 # GraphAlign: store raw sequence features before pooling
-                if self.use_graphalign and compute_graph and anchor == modal:
-                    if anchor != "video":
-                        # x_feature is [B, L, D] (full sequence including CLS)
-                        raw_encoder_features[modal] = x_feature
-                    else:
-                        # Video features are already pooled to [B, D] in forward_features
-                        # Expand to [B, 1, D] for graph pooling compatibility
-                        raw_encoder_features[modal] = x_feature.unsqueeze(1) if x_feature.dim() == 2 else x_feature
+                if compute_graph:
+                    self._collect_raw_feature(modal, anchor, x_feature, raw_encoder_features)
 
                 if anchor != "video":
                     if self.global_pool_dict[anchor]:
@@ -918,43 +912,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             logit_scale_dict[m] = self.logit_scale[m].exp()
 
         # ===== GraphAlign: compute graph outputs =====
-        graph_outputs = {}
-        if self.use_graphalign and compute_graph and len(raw_encoder_features) > 0:
-            relationship_graphs = {}
-            expanded_graphs = {}
-
-            for modal, raw_feat in raw_encoder_features.items():
-                # Graph pooling: [B, L, D] -> [B, N, dgraph]
-                pooled_graph = self.graph_poolers[modal](raw_feat.float())
-
-                # Build relationship graph: [B, N, N]
-                R = self.graph_builder(pooled_graph)
-                relationship_graphs[modal] = R
-
-                # Expand graph: [B, P+1, N, N]
-                G = self.graph_expander(R)
-                expanded_graphs[modal] = G
-
-            # Cross-modal fusion for available modality pairs
-            fused_graphs = {}
-            modals_present = list(raw_encoder_features.keys())
-            for idx_i, m1 in enumerate(modals_present):
-                for m2 in modals_present[idx_i + 1:]:
-                    # Check both orderings for the fusion key
-                    key = f"{m1}_{m2}"
-                    key_rev = f"{m2}_{m1}"
-                    if key in self.graph_fusers:
-                        fused = self.graph_fusers[key](expanded_graphs[m1], expanded_graphs[m2])
-                        fused_graphs[key] = fused
-                    elif key_rev in self.graph_fusers:
-                        fused = self.graph_fusers[key_rev](expanded_graphs[m2], expanded_graphs[m1])
-                        fused_graphs[key_rev] = fused
-
-            graph_outputs = dict(
-                relationship_graphs=relationship_graphs,
-                expanded_graphs=expanded_graphs,
-                fused_graphs=fused_graphs,
-            )
+        graph_outputs = self._compute_graph_outputs(raw_encoder_features) if compute_graph else {}
 
         return dict(
             logits=logits,
@@ -967,6 +925,59 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             graph_outputs=graph_outputs,
         )
     
+    # ===== GraphAlign helper methods =====
+
+    def _collect_raw_feature(self, modal, anchor, x_feature, raw_encoder_features):
+        """Store raw encoder features for graph construction when applicable."""
+        if not self.use_graphalign or anchor != modal:
+            return
+        if modal != "video":
+            raw_encoder_features[modal] = x_feature
+        else:
+            raw_encoder_features[modal] = x_feature.unsqueeze(1) if x_feature.dim() == 2 else x_feature
+
+    def _compute_graph_outputs(self, raw_encoder_features):
+        """Run the full graph pipeline: pooling -> relationship -> expansion -> fusion."""
+        if not self.use_graphalign or not raw_encoder_features:
+            return {}
+
+        relationship_graphs = {}
+        expanded_graphs = {}
+
+        for modal, raw_feat in raw_encoder_features.items():
+            pooled_graph = self.graph_poolers[modal](raw_feat.float())
+            R = self.graph_builder(pooled_graph)
+            relationship_graphs[modal] = R
+            expanded_graphs[modal] = self.graph_expander(R)
+
+        fused_graphs = self._fuse_graphs(expanded_graphs)
+
+        return dict(
+            relationship_graphs=relationship_graphs,
+            expanded_graphs=expanded_graphs,
+            fused_graphs=fused_graphs,
+        )
+
+    def _fuse_graphs(self, expanded_graphs):
+        """Cross-modal fusion for all available modality pairs."""
+        fused_graphs = {}
+        modals_present = list(expanded_graphs.keys())
+
+        for idx_i, m1 in enumerate(modals_present):
+            for m2 in modals_present[idx_i + 1:]:
+                key = f"{m1}_{m2}"
+                key_rev = f"{m2}_{m1}"
+                if key in self.graph_fusers:
+                    fused_graphs[key] = self.graph_fusers[key](
+                        expanded_graphs[m1], expanded_graphs[m2]
+                    )
+                elif key_rev in self.graph_fusers:
+                    fused_graphs[key_rev] = self.graph_fusers[key_rev](
+                        expanded_graphs[m2], expanded_graphs[m1]
+                    )
+
+        return fused_graphs
+
     def load_balance_loss(self):
         aux_balance_loss_coef=1.0
         # param_dict = {name: param for name, param in self.named_parameters()}
