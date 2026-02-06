@@ -1400,13 +1400,14 @@ def train_one_epoch_concat(
                 # GraphAlign: cache relationship graphs from no-grad pass
                 # Bounded FIFO: keep at most accum_iter graphs per modality
                 # to control memory and torch.cat cost in the loss loop.
-                if use_graphalign and output.get("graph_outputs"):
-                    max_graph_cache = max(1, accum_iter)
+                # When accum_iter <= 0 (no accumulation), skip caching entirely
+                # — graph losses will only use the current gradient step's graphs.
+                if use_graphalign and accum_iter > 0 and output.get("graph_outputs"):
                     for modal_key, R in output["graph_outputs"].get("relationship_graphs", {}).items():
                         if modal_key in accum_relationship_graphs:
                             accum_relationship_graphs[modal_key].append(R)
-                            if len(accum_relationship_graphs[modal_key]) > max_graph_cache:
-                                accum_relationship_graphs[modal_key] = accum_relationship_graphs[modal_key][-max_graph_cache:]
+                            if len(accum_relationship_graphs[modal_key]) > accum_iter:
+                                accum_relationship_graphs[modal_key] = accum_relationship_graphs[modal_key][-accum_iter:]
                         else:
                             accum_relationship_graphs[modal_key] = [R]
 
