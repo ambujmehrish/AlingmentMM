@@ -1401,7 +1401,7 @@ def train_one_epoch_concat(
                 # Bounded FIFO: keep at most accum_iter graphs per modality
                 # to control memory and torch.cat cost in the loss loop.
                 if use_graphalign and output.get("graph_outputs"):
-                    max_graph_cache = accum_iter
+                    max_graph_cache = max(1, accum_iter)
                     for modal_key, R in output["graph_outputs"].get("relationship_graphs", {}).items():
                         if modal_key in accum_relationship_graphs:
                             accum_relationship_graphs[modal_key].append(R)
