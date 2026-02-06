@@ -957,7 +957,9 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         Then cross-modal fusion for each pair.
 
         Args:
-            raw_encoder_features: {modality: tensor [B, L, D]}
+            raw_encoder_features: {modality: tensor [B, L, D]} for most
+                modalities; video features arrive as [B, 1, D] (expanded
+                from [B, D] by _collect_raw_feature).
         Returns:
             dict with relationship_graphs {modal: [B, N, N]},
             expanded_graphs {modal: [B, P+1, N, N]},
