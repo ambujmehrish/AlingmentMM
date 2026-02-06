@@ -5,11 +5,14 @@ and end-to-end trainability.
 """
 
 import sys
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-# Add project root to path
-sys.path.insert(0, ".")
+# Add project root to path (robust to any working directory)
+_PROJECT_ROOT = str(Path(__file__).resolve().parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from src.models.graph_pooling import GraphAwarePooling
 from src.models.relationship_graph import RelationshipGraphBuilder
