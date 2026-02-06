@@ -63,6 +63,14 @@ from util.clip_loss import (
     single_cross_modal_kd_loss_plm,
 )
 
+from util.graph_losses import (
+    graph_contrastive_loss,
+    soft_graph_binding_loss,
+    anchor_distillation_loss,
+    graph_knowledge_distillation_loss,
+    graph_regularization_loss,
+)
+
 from datasets.constants import PC_META_DATA_DIR
 from datasets.modal_depth.data.scene_cls_template import SCENE_CLS_TEMPLATE
 from datasets.modal_audio.data.sound_cls_template import SOUND_AS_IMAGE_TEMPLATE
@@ -939,6 +947,9 @@ def train_one_epoch_concat(
     accum_kd_t_features = {}
     accum_kd_text_features = {}
     accum_kd_image_features = {}
+    accum_relationship_graphs = {}  # GraphAlign: cached relationship graphs
+
+    use_graphalign = getattr(args, 'use_graphalign', False)
 
     for data_iter_step, batch in enumerate(
         metric_logger.log_every(
@@ -1372,6 +1383,7 @@ def train_one_epoch_concat(
                     mask_t_prob=args.mask_t_prob,
                     mask_f_prob=args.mask_f_prob,
                     extract_feature=args.multi_modal_distill,
+                    compute_graph=use_graphalign,
                 )
                 output.pop("logit_scale")
                 output.pop("logits")
@@ -1384,6 +1396,14 @@ def train_one_epoch_concat(
                         accum_features[key] = {}
                         for anchor, anchor_val in val.items():
                             accum_features[key][anchor] = [anchor_val]
+
+                # GraphAlign: cache relationship graphs from no-grad pass
+                if use_graphalign and output.get("graph_outputs"):
+                    for modal_key, R in output["graph_outputs"].get("relationship_graphs", {}).items():
+                        if modal_key in accum_relationship_graphs:
+                            accum_relationship_graphs[modal_key].append(R)
+                        else:
+                            accum_relationship_graphs[modal_key] = [R]
 
                 if args.multi_modal_distill:
                     for key, val in output["teacher_features"].items():
@@ -1458,6 +1478,7 @@ def train_one_epoch_concat(
                         mask_t_prob=args.mask_t_prob,
                         mask_f_prob=args.mask_f_prob,
                         extract_feature=args.multi_modal_distill,
+                        compute_graph=use_graphalign,
                     )
 
                     samples_proj2text_features = {}
@@ -1730,6 +1751,76 @@ def train_one_epoch_concat(
                                 loss += val
                             metric_logger.update(**kd_t_loss)
 
+                    # ===== GraphAlign Losses =====
+                    if use_graphalign and output.get("graph_outputs"):
+                        graph_out = output["graph_outputs"]
+                        cur_R_graphs = graph_out.get("relationship_graphs", {})
+
+                        lambda_graph_nce = getattr(args, 'lambda_graph_nce', 1.0)
+                        lambda_soft_bind = getattr(args, 'lambda_soft_bind', 1.0)
+                        lambda_graph_reg = getattr(args, 'lambda_graph_reg', 0.01)
+                        graph_temperature = getattr(args, 'graph_temperature', 0.07)
+
+                        # 1. Graph Contrastive Loss: current modality vs cached others
+                        if cur_modal in cur_R_graphs:
+                            R_cur = cur_R_graphs[cur_modal]
+                            for other_modal, cached_R_list in accum_relationship_graphs.items():
+                                if other_modal != cur_modal and len(cached_R_list) > 0:
+                                    # Use the most recent cached graph
+                                    R_other = torch.cat(cached_R_list, dim=0)
+                                    # Align batch sizes (take min)
+                                    min_B = min(R_cur.size(0), R_other.size(0))
+                                    if min_B > 1:
+                                        g_nce = graph_contrastive_loss(
+                                            R_cur[:min_B].float(),
+                                            R_other[:min_B].float(),
+                                            temperature=graph_temperature,
+                                        )
+                                        g_nce_weighted = lambda_graph_nce * g_nce
+                                        if args.task_balancer == "uncertainty":
+                                            loss_dict[f"graph_nce_{cur_modal}_{other_modal}"] = g_nce_weighted
+                                        else:
+                                            loss += g_nce_weighted
+                                            metric_logger.update(**{f"graph_nce_{cur_modal}_{other_modal}": g_nce.item()})
+
+                        # 2. Soft Graph Binding Loss
+                        if cur_modal in cur_R_graphs and cur_modal in trgets_dict:
+                            R_cur = cur_R_graphs[cur_modal]
+                            y_cur = trgets_dict[cur_modal][i]
+                            if y_cur.dim() > 1:
+                                y_cur = y_cur.argmax(dim=-1)
+                            for other_modal, cached_R_list in accum_relationship_graphs.items():
+                                if other_modal != cur_modal and other_modal in trgets_dict and len(cached_R_list) > 0:
+                                    R_other = torch.cat(cached_R_list, dim=0)
+                                    y_other = torch.cat(trgets_dict[other_modal], dim=0)
+                                    if y_other.dim() > 1:
+                                        y_other = y_other.argmax(dim=-1)
+                                    min_B = min(R_cur.size(0), R_other.size(0))
+                                    if min_B > 1:
+                                        sb_loss = soft_graph_binding_loss(
+                                            R_cur[:min_B].float(),
+                                            R_other[:min_B].float(),
+                                            y_cur[:min_B],
+                                            y_other[:min_B],
+                                        )
+                                        sb_loss_weighted = lambda_soft_bind * sb_loss
+                                        if args.task_balancer == "uncertainty":
+                                            loss_dict[f"graph_bind_{cur_modal}_{other_modal}"] = sb_loss_weighted
+                                        else:
+                                            loss += sb_loss_weighted
+                                            metric_logger.update(**{f"graph_bind_{cur_modal}_{other_modal}": sb_loss.item()})
+
+                        # 3. Graph Regularization Loss
+                        if cur_modal in cur_R_graphs:
+                            R_cur = cur_R_graphs[cur_modal]
+                            g_reg = graph_regularization_loss(R_cur.float())
+                            g_reg_weighted = lambda_graph_reg * g_reg
+                            if args.task_balancer == "uncertainty":
+                                loss_dict[f"graph_reg_{cur_modal}"] = g_reg_weighted
+                            else:
+                                loss += g_reg_weighted
+                                metric_logger.update(**{f"graph_reg_{cur_modal}": g_reg.item()})
+
                     # weighted_task_losses = loss_balancer.module[cur_modal](loss_dict)
                     # metric_logger.update(**weighted_task_losses)
                     # loss = sum(weighted_task_losses.values())
@@ -1782,6 +1873,7 @@ def train_one_epoch_concat(
         accum_kd_t_features = {}
         accum_kd_text_features = {}
         accum_kd_image_features = {}
+        accum_relationship_graphs = {}  # GraphAlign: reset cached graphs
 
         min_lr = 10.0
         max_lr = 0.0

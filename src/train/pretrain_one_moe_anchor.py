@@ -993,6 +993,40 @@ def get_args_parser():
 
     parser.add_argument("--expert_nums", type=int, default=1)
 
+    # ===== GraphAlign Arguments =====
+    parser.add_argument(
+        "--use_graphalign", action="store_true", default=False,
+        help="Enable GraphAlign graph-based multi-modal alignment",
+    )
+    parser.add_argument(
+        "--graph_target_length", type=int, default=32,
+        help="Number of graph nodes N after pooling (default: 32)",
+    )
+    parser.add_argument(
+        "--graph_dim", type=int, default=256,
+        help="Graph feature dimension dgraph (default: 256)",
+    )
+    parser.add_argument(
+        "--graph_expansion_order", type=int, default=3,
+        help="Graph expansion polynomial order P (default: 3)",
+    )
+    parser.add_argument(
+        "--lambda_graph_nce", type=float, default=1.0,
+        help="Weight for graph contrastive loss (default: 1.0)",
+    )
+    parser.add_argument(
+        "--lambda_soft_bind", type=float, default=1.0,
+        help="Weight for soft graph binding loss (default: 1.0)",
+    )
+    parser.add_argument(
+        "--lambda_graph_reg", type=float, default=0.01,
+        help="Weight for graph regularization loss (default: 0.01)",
+    )
+    parser.add_argument(
+        "--graph_temperature", type=float, default=0.07,
+        help="Temperature for graph contrastive loss (default: 0.07)",
+    )
+
     return parser
 
 
