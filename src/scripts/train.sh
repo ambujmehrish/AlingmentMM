@@ -307,3 +307,11 @@ python -m torch.distributed.launch --nproc_per_node=4 src/train/pretrain_one_moe
     --use_peft \
     --multi_modal_distill \
     --multi_modal_distill_modal_list \
+    --use_graphalign \
+    --graph_target_length 32 \
+    --graph_dim 256 \
+    --graph_expansion_order 3 \
+    --lambda_graph_nce 1.0 \
+    --lambda_soft_bind 1.0 \
+    --lambda_graph_reg 0.01 \
+    --graph_temperature 0.07 \

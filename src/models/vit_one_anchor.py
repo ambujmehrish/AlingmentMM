@@ -31,6 +31,12 @@ from torch.utils.checkpoint import checkpoint
 from util.pos_embed import build_2d_sincos_posemb
 from einops import rearrange
 
+# GraphAlign imports
+from src.models.graph_pooling import GraphAwarePooling
+from src.models.relationship_graph import RelationshipGraphBuilder
+from src.models.graph_expansion import GraphExpansion
+from src.models.graph_fusion import CrossModalGraphFusion, FusionClassifier
+
 # sin-cos position encoding
 # https://github.com/jadore801120/attention-is-all-you-need-pytorch/blob/master/transformer/Models.py#L31
 def get_sinusoid_encoding_table(n_position, d_hid):
@@ -537,8 +543,39 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
                 )
 
         self.use_orthogonal_loss = args.use_orthogonal_loss
-        
+
         self.use_moe_loss = args.use_moe_loss
+
+        # ===== GraphAlign Components =====
+        self.use_graphalign = getattr(args, 'use_graphalign', False)
+        if self.use_graphalign:
+            graph_target_length = getattr(args, 'graph_target_length', 32)
+            graph_dim = getattr(args, 'graph_dim', 256)
+            graph_expansion_order = getattr(args, 'graph_expansion_order', 3)
+
+            # Per-modality graph pooling modules
+            self.graph_poolers = nn.ModuleDict()
+            for modal in self.modals:
+                self.graph_poolers[modal] = GraphAwarePooling(
+                    input_dim=self.embed_dim,
+                    target_length=graph_target_length,
+                    graph_dim=graph_dim,
+                )
+
+            # Shared relationship graph builder
+            self.graph_builder = RelationshipGraphBuilder()
+
+            # Shared graph expansion
+            self.graph_expander = GraphExpansion(order=graph_expansion_order)
+
+            # Cross-modal fusion modules (one per unordered modality pair)
+            self.graph_fusers = nn.ModuleDict()
+            for idx_i, m1 in enumerate(self.modals):
+                for m2 in self.modals[idx_i + 1:]:
+                    key = f"{m1}_{m2}"
+                    self.graph_fusers[key] = CrossModalGraphFusion(
+                        order=graph_expansion_order,
+                    )
 
         self.apply(self._init_weights)
 
@@ -796,6 +833,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         mask_t_prob=0.0,
         mask_f_prob=0.0,
         extract_feature=False,
+        compute_graph=False,
     ) -> torch.Tensor:
         logits = {}
         feature_dict = {}
@@ -804,19 +842,22 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         logit_scale_dict = {}
 
         orth_loss = {}
-        
+
         moe_loss = {}
-        
+
+        # GraphAlign: collect raw encoder features for graph construction
+        raw_encoder_features = {}
+
         # modal_embed_dict={}
         for i, _ in enumerate(x_list):
             modal = modal_list[i]
 
             anchor_feature = {}
-            
+
             anchor_teacher_feature = {}
-            
+
             modal_moe_loss=0.0
-            
+
             for anchor in anchor_list:
                 x_anchor = x_list[i][anchor]
                 x_feature = self.forward_features(
@@ -825,7 +866,17 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
                 if self.has_cls_head[modal] and anchor == modal:
                     x = self.forward_head(x_feature, modal)
                     logits[modal] = x
-                
+
+                # GraphAlign: store raw sequence features before pooling
+                if self.use_graphalign and compute_graph and anchor == modal:
+                    if anchor != "video":
+                        # x_feature is [B, L, D] (full sequence including CLS)
+                        raw_encoder_features[modal] = x_feature
+                    else:
+                        # Video features are already pooled to [B, D] in forward_features
+                        # Expand to [B, 1, D] for graph pooling compatibility
+                        raw_encoder_features[modal] = x_feature.unsqueeze(1) if x_feature.dim() == 2 else x_feature
+
                 if anchor != "video":
                     if self.global_pool_dict[anchor]:
                         pooled_faeature = x_feature.mean(dim=1)
@@ -845,7 +896,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
                 if self.use_orthogonal_loss and anchor != "image":
                     orthogonal_loss = self.orthogonal_loss()
                     orth_loss.update({f"orthogonal_loss_{modal}": orthogonal_loss})
-                
+
                 if self.use_moe_loss and anchor == modal:
                     modal_moe_loss += self.load_balance_loss()
 
@@ -855,16 +906,55 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
                     dim=-1, keepdim=True
                 )
                 visual_feature = visual_feature.to(dtype=torch.float16)
-                
+
                 anchor_feature[anchor] = visual_feature
             feature_dict[modal] = anchor_feature
             out_teacher_feature_dict[modal] = anchor_teacher_feature
-            
+
             if self.use_moe_loss:
                 moe_loss.update({f'{modal}_moe_loss':modal_moe_loss})
 
         for m in self.modals:
             logit_scale_dict[m] = self.logit_scale[m].exp()
+
+        # ===== GraphAlign: compute graph outputs =====
+        graph_outputs = {}
+        if self.use_graphalign and compute_graph and len(raw_encoder_features) > 0:
+            relationship_graphs = {}
+            expanded_graphs = {}
+
+            for modal, raw_feat in raw_encoder_features.items():
+                # Graph pooling: [B, L, D] -> [B, N, dgraph]
+                pooled_graph = self.graph_poolers[modal](raw_feat.float())
+
+                # Build relationship graph: [B, N, N]
+                R = self.graph_builder(pooled_graph)
+                relationship_graphs[modal] = R
+
+                # Expand graph: [B, P+1, N, N]
+                G = self.graph_expander(R)
+                expanded_graphs[modal] = G
+
+            # Cross-modal fusion for available modality pairs
+            fused_graphs = {}
+            modals_present = list(raw_encoder_features.keys())
+            for idx_i, m1 in enumerate(modals_present):
+                for m2 in modals_present[idx_i + 1:]:
+                    # Check both orderings for the fusion key
+                    key = f"{m1}_{m2}"
+                    key_rev = f"{m2}_{m1}"
+                    if key in self.graph_fusers:
+                        fused = self.graph_fusers[key](expanded_graphs[m1], expanded_graphs[m2])
+                        fused_graphs[key] = fused
+                    elif key_rev in self.graph_fusers:
+                        fused = self.graph_fusers[key_rev](expanded_graphs[m2], expanded_graphs[m1])
+                        fused_graphs[key_rev] = fused
+
+            graph_outputs = dict(
+                relationship_graphs=relationship_graphs,
+                expanded_graphs=expanded_graphs,
+                fused_graphs=fused_graphs,
+            )
 
         return dict(
             logits=logits,
@@ -874,6 +964,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             logit_scale=logit_scale_dict,
             moe_loss=moe_loss,
             orth_loss=orth_loss,
+            graph_outputs=graph_outputs,
         )
     
     def load_balance_loss(self):
