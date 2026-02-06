@@ -928,7 +928,18 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
     # ===== GraphAlign helper methods =====
 
     def _collect_raw_feature(self, modal, anchor, x_feature, raw_encoder_features):
-        """Store raw encoder features for graph construction when applicable."""
+        """Store raw encoder features for graph construction when applicable.
+
+        Only stores when self.use_graphalign is True and anchor == modal
+        (i.e. the modality's own encoding, not a cross-modal anchor).
+
+        Args:
+            modal: current modality name
+            anchor: current anchor name
+            x_feature: encoder output — [B, L, D] for most modalities,
+                       [B, D] for video (gets expanded to [B, 1, D])
+            raw_encoder_features: dict to populate, keyed by modality name
+        """
         if not self.use_graphalign or anchor != modal:
             return
         if modal != "video":
@@ -937,7 +948,21 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             raw_encoder_features[modal] = x_feature.unsqueeze(1) if x_feature.dim() == 2 else x_feature
 
     def _compute_graph_outputs(self, raw_encoder_features):
-        """Run the full graph pipeline: pooling -> relationship -> expansion -> fusion."""
+        """Run the full graph pipeline on collected encoder features.
+
+        Pipeline per modality:
+            raw_feat [B, L, D] -> GraphAwarePooling -> [B, N, dgraph]
+            -> RelationshipGraphBuilder -> R [B, N, N]
+            -> GraphExpansion -> G [B, P+1, N, N]
+        Then cross-modal fusion for each pair.
+
+        Args:
+            raw_encoder_features: {modality: tensor [B, L, D]}
+        Returns:
+            dict with relationship_graphs {modal: [B, N, N]},
+            expanded_graphs {modal: [B, P+1, N, N]},
+            fused_graphs {pair_key: [B, N, N]}, or {} if disabled.
+        """
         if not self.use_graphalign or not raw_encoder_features:
             return {}
 
@@ -959,7 +984,13 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         )
 
     def _fuse_graphs(self, expanded_graphs):
-        """Cross-modal fusion for all available modality pairs."""
+        """Cross-modal fusion for all available modality pairs.
+
+        Args:
+            expanded_graphs: {modality: [B, P+1, N, N]}
+        Returns:
+            {pair_key: [B, N, N]} fused graph for each unordered pair.
+        """
         fused_graphs = {}
         modals_present = list(expanded_graphs.keys())
 
